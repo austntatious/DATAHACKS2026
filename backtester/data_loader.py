@@ -660,8 +660,22 @@ def build_timeline(
         )
 
     # Build timeline tick by tick
-    logger.info(f"Building timeline: {global_end - global_start + 1} seconds")
+    total_secs = global_end - global_start + 1
+    logger.info(f"Building timeline: {total_secs} seconds, {len(lifecycles)} markets")
     timeline: list[TickData] = []
+
+    # Sort lifecycle events so we only look at *currently active* markets per tick.
+    # Without this, the inner slug loop is O(T * N) = billions of iterations on
+    # the full train set (641K seconds * 8.4K markets).
+    starts_sorted = sorted(
+        ((lc.start_ts, lc.market_slug) for lc in lifecycles), key=lambda x: x[0]
+    )
+    ends_sorted = sorted(
+        ((lc.end_ts, lc.market_slug) for lc in lifecycles), key=lambda x: x[0]
+    )
+    start_idx = 0
+    end_idx = 0
+    active_slugs: set[str] = set()
 
     # Track last known values for forward-filling
     last_btc_mid = 0.0
@@ -669,7 +683,19 @@ def build_timeline(
     last_chainlink = 0.0
     last_books: dict[str, dict] = {}  # slug -> {yes_book, no_book, book_ts}
 
+    progress_step = max(total_secs // 10, 1)
+
     for ts in range(global_start, global_end + 1):
+        # Advance active set
+        while start_idx < len(starts_sorted) and starts_sorted[start_idx][0] <= ts:
+            active_slugs.add(starts_sorted[start_idx][1])
+            start_idx += 1
+        while end_idx < len(ends_sorted) and ends_sorted[end_idx][0] < ts:
+            expired = ends_sorted[end_idx][1]
+            active_slugs.discard(expired)
+            last_books.pop(expired, None)
+            end_idx += 1
+
         tick = TickData(ts_sec=ts)
 
         # Market prices (only available at recorded ticks)
@@ -677,7 +703,8 @@ def build_timeline(
             tick.market_prices = prices_grouped[ts]
 
         # Order books: forward-fill from last known snapshot using bisect
-        for slug in all_slugs:
+        # Only iterate the ~50-200 currently active markets, not all 8.4K.
+        for slug in active_slugs:
             if slug in book_ts_index:
                 ts_list = book_ts_index[slug]
                 idx = bisect.bisect_right(ts_list, ts) - 1
@@ -726,6 +753,13 @@ def build_timeline(
         tick.chainlink_btc = last_chainlink
 
         timeline.append(tick)
+
+        if len(timeline) % progress_step == 0:
+            pct = len(timeline) / total_secs * 100
+            logger.info(
+                f"  timeline build: {len(timeline):,}/{total_secs:,} "
+                f"({pct:.0f}%, active={len(active_slugs)})"
+            )
 
     logger.info(f"Timeline built: {len(timeline)} ticks, {len(lifecycles)} markets")
     return BacktestData(
