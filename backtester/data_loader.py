@@ -637,10 +637,11 @@ def build_timeline(
     # Release the prices DataFrame — the grouped dict has everything we need.
     # Without this, pandas holds ~1 GB of row data alive through the JSON-parse
     # step below, causing GC thrashing on OneDrive-synced directories.
+    # We rely on refcount-based cleanup; no explicit gc.collect() (scanning
+    # the ~9M book-level objects takes over two minutes on big datasets).
     del prices_df
     del binance_df, chainlink_df
     import gc
-    gc.collect()
 
     # Filter books_df to requested assets too (skip parsing SOL/ETH order books)
     if assets and not books_df.empty and "market_slug" in books_df.columns:
@@ -714,8 +715,9 @@ def build_timeline(
             gc.enable()
 
         # Release the raw books DataFrame — parsed snapshots have all we need.
+        # NO explicit gc.collect() — scanning the ~9M book-level objects
+        # we just created would cost 2+ minutes and saves nothing material.
         del books_df, slim
-        gc.collect()
 
     # Track which slugs have JSONL books vs need synthetic
     slugs_with_books = set(books_by_slug.keys())
